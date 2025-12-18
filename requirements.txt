@@ -56,4 +56,9 @@ alembic==1.8.1
 
 setuptools>=42.0.0
 
+
+
 itsdangerous==2.2.0
+
+
+starlette==0.50.0

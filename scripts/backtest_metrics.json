@@ -1,0 +1,17 @@
+{
+  "cumulative_return": 0.958597844107173,
+  "total_return": -0.04220448924252959,
+  "sharpe": -0.7978014541448937,
+  "max_drawdown": -0.043483648000985864,
+  "n_trades": 60,
+  "win_rate": 0.2666666666622222,
+  "avg_win": 0.001243982099008895,
+  "avg_loss": -0.001411550064242543,
+  "profit_factor": 0.3204683497157395,
+  "symbol": "RELIANCE.NS",
+  "model_path": "app\\storage\\rf_model.pkl",
+  "run_at": "2025-10-15T09:54:02.020175",
+  "prob_threshold": 0.75,
+  "hold_bars": 3,
+  "cooldown": 2
+}

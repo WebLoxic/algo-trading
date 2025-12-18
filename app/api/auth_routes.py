@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from dotenv import load_dotenv
 from jose import jwt, JWTError, ExpiredSignatureError
-from sqlalchemy.exc import IntegrityError
 
 # Email libs
 import smtplib
@@ -303,60 +302,36 @@ def send_reset_email(to_email: str, token: str):
 
 
 # ------------------------ REGISTER ------------------------
+@router.post("/register", response_model=UserOut)
+def register(payload: RegisterPayload, request: Request, db: Session = Depends(get_db)):
+    # normalize email
+    email = payload.email.strip().lower()
 
-@router.post("/register", response_model=UserRegisterOut, status_code=201)
-def register(
-    payload: RegisterPayload,
-    request: Request,
-    db: Session = Depends(get_db)
-):
-    try:
-        email = payload.email.strip().lower()
+    # if Credential model exists
+    if hasattr(models, "Credential"):
+        # check existing credential
+        existing = db.query(models.Credential).filter(models.Credential.email == email).first()
+        if existing:
+            raise HTTPException(400, "Email already registered")
 
-        # Ensure Credential model exists
-        if not hasattr(models, "Credential"):
-            raise HTTPException(status_code=500, detail="Credential model missing")
-
-        # Check existing email
-        if db.query(models.Credential).filter(models.Credential.email == email).first():
-            raise HTTPException(status_code=400, detail="Email already registered")
-
-        # Create user
-        user = models.User(
-            full_name=payload.full_name,
-            email=email
-        )
+        # create user and credential, ensure user.email set BEFORE commit
+        user = models.User(full_name=payload.full_name, email=email)
         db.add(user)
-        db.flush()  # generate user.id
+        db.flush()  # ensures user.id is present
 
-        # Create credential
         cred = models.Credential(
             user_id=user.id,
             email=email,
-            hashed_password=get_password_hash(payload.password)
+            hashed_password=get_password_hash(payload.password),
         )
         db.add(cred)
 
+        # commit once for both user + credential
         db.commit()
-        db.refresh(user)
-
-        # IMPORTANT: return only safe fields
+        db.refresh(user)  # refresh object from DB (optional)
         return user
 
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="Email already exists")
-
-    except HTTPException:
-        db.rollback()
-        raise
-
-    except Exception as e:
-        db.rollback()
-        log.exception("REGISTER ERROR: %s", e)
-        raise HTTPException(status_code=500, detail="Internal Server Error")
-
-
+    raise HTTPException(500, "User/Credential model missing")
 
 
 # ------------------------ LOGIN ------------------------
@@ -365,86 +340,215 @@ def register(
 
 
 @router.post("/login")
-def login(
-    payload: LoginPayload,
-    response: Response,
-    db: Session = Depends(get_db),
-    request: Request = None
-):
+def login(payload: LoginPayload, response: Response, db: Session = Depends(get_db), request: Request = None):
+    """
+    Login flow:
+      - prefer models.Credential (join to User)
+      - fallback to direct users table if credentials not used
+    Improvements:
+      - safer/more consistent HTTPException usage
+      - avoid logging sensitive prefixes
+      - set cookie 'secure' depending on request.scheme (useful for localhost HTTPS)
+      - also return token in header for easier manual testing
+      - defensive checks for missing password/email
+    """
     try:
-        if not payload.email or not payload.password:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Missing email or password"
-            )
+        if not payload or not (payload.email and payload.password):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing email or password")
 
+        cred = None
+        user = None
+
+        # normalize email
         email = payload.email.strip().lower()
 
-        # Prefer Credential table
-        cred = db.query(models.Credential).filter(
-            models.Credential.email == email
-        ).first()
+        # log only safe info
+        log.info("Login attempt email=%s pwd_len=%s", email, len(payload.password or ""))
 
-        if not cred or not cred.user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials"
-            )
+        if hasattr(models, "Credential"):
+            cred = db.query(models.Credential).filter(models.Credential.email == email).first()
+            if cred:
+                user = cred.user
+                hashed = getattr(cred, "hashed_password", None)
 
-        if not verify_password(payload.password, cred.hashed_password):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials"
-            )
+                # do not log hash prefix; log only length
+                log.info("Checking cred uid=%s email=%s hash_len=%s",
+                         getattr(cred, "user_id", None), email, len(hashed or ""))
 
-        user = cred.user
+                if not hashed:
+                    log.warning("Credential row missing hashed_password for email=%s", email)
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+                if not verify_password(payload.password, hashed):
+                    log.info("Invalid password for %s", email)
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+            else:
+                # fallback to users table (legacy)
+                user_row = db.query(models.User).filter(models.User.email == email).first()
+                if not user_row:
+                    log.info("Login: user not found (no credential): %s", email)
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-        # Generate JWT
-        token = create_access_token(
-            email=user.email,
-            uid=user.id
-        )
+                hashed = getattr(user_row, "hashed_password", None)
+                log.info("Checking user row id=%s email=%s hash_len=%s",
+                         getattr(user_row, "id", None), email, len(hashed or ""))
 
-        resp = JSONResponse(
-            {
-                "ok": True,
-                "access_token": token,
-                "token_type": "bearer"
-            }
-        )
+                if not hashed:
+                    log.info("No hashed password found for user in users table: %s", email)
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+                if not verify_password(payload.password, hashed):
+                    log.info("Invalid password for %s (users table)", email)
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+                user = user_row
+        else:
+            # No Credential model: check users table
+            user_row = db.query(models.User).filter(models.User.email == email).first()
+            if not user_row:
+                log.info("Login: user not found (users only): %s", email)
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-        # Header (debug friendly)
+            hashed = getattr(user_row, "hashed_password", None)
+            log.info("Checking user (no credentials model) id=%s email=%s hash_len=%s",
+                     getattr(user_row, "id", None), email, len(hashed or ""))
+
+            if not hashed:
+                log.info("Login: user has no hashed_password column/data: %s", email)
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+            if not verify_password(payload.password, hashed):
+                log.info("Invalid password for %s (users only)", email)
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+            user = user_row
+
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+        uid = getattr(user, "id", None)
+        email_val = getattr(user, "email", None) or email
+
+        token = create_access_token(email=email_val, uid=uid)
+
+        resp = JSONResponse({"ok": True, "access_token": token, "token_type": "bearer"})
+        # also expose token in a header for quick manual testing (avoid using this in production)
         resp.headers["X-Access-Token"] = token
 
-        # Secure cookie logic
+        # Decide whether cookie should be marked as secure:
+        # - If the incoming request is HTTPS, set secure=True.
+        # - On local HTTP (localhost) setting secure=True will prevent the browser sending cookie.
         secure_flag = False
         try:
-            secure_flag = request is not None and request.url.scheme == "https"
+            # request may be None in some test setups; guard
+            secure_flag = (request is not None and request.url.scheme == "https")
         except Exception:
-            pass
+            secure_flag = False
 
         resp.set_cookie(
-            key=COOKIE_NAME,
-            value=token,
+            COOKIE_NAME,
+            token,
             httponly=True,
             samesite="lax",
             secure=secure_flag,
             max_age=COOKIE_MAX_AGE,
             path="/"
         )
-
         return resp
 
     except HTTPException:
+        # re-raise to preserve status and detail
         raise
+    except Exception as ex:
+        log.exception("Unexpected error in login: %s", ex)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server error")   
 
-    except Exception as e:
-        log.exception("LOGIN ERROR: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server error"
-        )
 
+
+
+# BAckup 
+# @router.post("/login")
+# def login(payload: LoginPayload, response: Response, db: Session = Depends(get_db)):
+#     """
+#     Login flow:
+#       - Prefer models.Credential (join to User)
+#       - Fallback to direct users table if credentials not used
+#     """
+#     try:
+#         cred = None
+#         user = None
+
+#         # normalize email
+#         email = payload.email.strip().lower()
+
+#         # log password length (safe), useful to detect client-side issues
+#         log.info("Login attempt email=%s pwd_len=%s", email, len(payload.password or ""))
+
+#         if hasattr(models, "Credential"):
+#             cred = db.query(models.Credential).filter(models.Credential.email == email).first()
+#             if cred:
+#                 user = cred.user
+#                 hashed = getattr(cred, "hashed_password", None)
+
+#                 # safe metadata logging: stored hash length + prefix
+#                 log.info("Checking cred uid=%s email=%s hash_len=%s hash_prefix=%s",
+#                          getattr(cred, "user_id", None), email, len(hashed or ""), (hashed or "")[:10])
+
+#                 if not hashed:
+#                     log.warning("Credential row missing hashed_password for email=%s", email)
+#                     raise HTTPException(401, "Invalid credentials")
+#                 if not verify_password(payload.password, hashed):
+#                     log.info("Invalid password for %s", email)
+#                     raise HTTPException(401, "Invalid credentials")
+#             else:
+#                 # no credential row — attempt fallback to users table (legacy)
+#                 user_row = db.query(models.User).filter(models.User.email == email).first()
+#                 if not user_row:
+#                     log.info("Login: user not found (no credential): %s", email)
+#                     raise HTTPException(401, "Invalid credentials")
+#                 # check if users table stores hashed_password directly
+#                 hashed = getattr(user_row, "hashed_password", None)
+
+#                 log.info("Checking user row id=%s email=%s hash_len=%s hash_prefix=%s",
+#                          getattr(user_row, "id", None), email, len(hashed or ""), (hashed or "")[:10])
+
+#                 if not hashed:
+#                     log.info("No hashed password found for user in users table: %s", email)
+#                     raise HTTPException(401, "Invalid credentials")
+#                 if not verify_password(payload.password, hashed):
+#                     log.info("Invalid password for %s (users table)", email)
+#                     raise HTTPException(401, "Invalid credentials")
+#                 user = user_row
+#         else:
+#             # No Credential model: check users table
+#             user_row = db.query(models.User).filter(models.User.email == email).first()
+#             if not user_row:
+#                 log.info("Login: user not found (users only): %s", email)
+#                 raise HTTPException(401, "Invalid credentials")
+#             hashed = getattr(user_row, "hashed_password", None)
+
+#             log.info("Checking user (no credentials model) id=%s email=%s hash_len=%s hash_prefix=%s",
+#                      getattr(user_row, "id", None), email, len(hashed or ""), (hashed or "")[:10])
+
+#             if not hashed:
+#                 log.info("Login: user has no hashed_password column/data: %s", email)
+#                 raise HTTPException(401, "Invalid credentials")
+#             if not verify_password(payload.password, hashed):
+#                 log.info("Invalid password for %s (users only)", email)
+#                 raise HTTPException(401, "Invalid credentials")
+#             user = user_row
+
+#         if user is None:
+#             raise HTTPException(401, "Invalid credentials")
+
+#         uid = getattr(user, "id", None)
+#         email_val = getattr(user, "email", None) or email
+
+#         token = create_access_token(email=email_val, uid=uid)
+
+#         resp = JSONResponse({"ok": True, "access_token": token, "token_type": "bearer"})
+#         resp.set_cookie(COOKIE_NAME, token, httponly=True, samesite="lax", max_age=COOKIE_MAX_AGE, path="/")
+#         return resp
+#     except HTTPException:
+#         raise
+#     except Exception as ex:
+#         log.exception("Unexpected error in login: %s", ex)
+#         raise HTTPException(500, "Server error")
 
 
 # ------------------------ FORGOT PASSWORD (send email) ------------------------

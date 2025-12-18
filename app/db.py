@@ -287,100 +287,124 @@
 
 
 
-
-
-
-
-
-# db.py
+# app/db.py  (or app/core/database.py — but be consistent)
 
 import os
 import logging
-from typing import Generator  # Import Generator for type hinting
+from typing import Generator
+
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# Set up logging
-log = logging.getLogger("app.db")
-log.setLevel(logging.INFO)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-log.addHandler(console_handler)
+# -------------------------------------------------
+# LOGGING (safe for reload)
+# -------------------------------------------------
 
-# Load environment variables from the .env file
+log = logging.getLogger("app.db")
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    )
+    log.addHandler(handler)
+
+# -------------------------------------------------
+# ENV
+# -------------------------------------------------
+
 load_dotenv()
 
-# DATABASE_URL examples:
-# postgresql+psycopg2://user:pass@host:5432/dbname
-# sqlite:///./app/storage/app.db
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app/storage/app.db").strip()
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///./app/storage/app.db"
+)
 
-# Engine kwargs (can be overridden with environment vars)
+# -------------------------------------------------
+# SQLALCHEMY BASE (SINGLE SOURCE OF TRUTH)
+# -------------------------------------------------
+
+Base = declarative_base()
+
+# -------------------------------------------------
+# ENGINE
+# -------------------------------------------------
+
 engine_kwargs = {
     "echo": os.getenv("DB_ECHO", "false").lower() in ("1", "true", "yes"),
     "future": True,
 }
 
-# Create SQLAlchemy engine
 engine = create_engine(DATABASE_URL, **engine_kwargs)
 
-# SessionLocal to interact with the DB
-SessionLocal = sessionmaker(bind=engine, autoflush=False, future=True, expire_on_commit=False)
+# -------------------------------------------------
+# SESSION
+# -------------------------------------------------
 
-# Base class for all models
-Base = declarative_base()
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    expire_on_commit=False,
+    future=True,
+)
+
+# -------------------------------------------------
+# INIT DB
+# -------------------------------------------------
 
 def init_db(create_timescale: bool = False) -> None:
     """
-    Initialize DB (create tables registered on Base).
-    If using Postgres and create_timescale=True, attempt to create timescaledb extension
-    and convert 'ticks' to hypertable. These operations are best-effort and errors are ignored.
+    Initialize database and create tables.
     """
-    log.info("Initializing the database...")  # Add log for database initialization
+    log.info("Initializing database...")
+
     try:
+        # IMPORTANT: this registers all models on Base
         import app.models  # noqa: F401
-    except Exception:
-        log.error("Failed to import models")
-    
-    # Create tables
+    except Exception as e:
+        log.error("Failed to import models: %s", e)
+        raise
+
     Base.metadata.create_all(bind=engine)
-    log.info("Database tables created (if not already present).")
-    
-    # TimescaleDB extension logic (if necessary)
-    if create_timescale and not DATABASE_URL.startswith("sqlite"):
+    log.info("Database tables ensured.")
+
+    # Optional: TimescaleDB support
+    if create_timescale and DATABASE_URL.startswith("postgres"):
         try:
-            with engine.connect() as conn:
+            with engine.begin() as conn:
                 try:
-                    conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"))
-                    conn.commit()
+                    conn.execute(
+                        text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
+                    )
                 except Exception as e:
-                    log.warning(f"Could not create timescaledb extension: {e}")
-                    
+                    log.warning("Timescale extension not created: %s", e)
+
                 try:
-                    exists_res = conn.execute(text("SELECT to_regclass('public.ticks') IS NOT NULL as exists;"))
-                    exists = exists_res.scalar()
+                    exists = conn.execute(
+                        text("SELECT to_regclass('public.ticks') IS NOT NULL;")
+                    ).scalar()
                     if exists:
-                        try:
-                            conn.execute(text("SELECT create_hypertable('ticks', 'ts', if_not_exists => TRUE);"))
-                            conn.commit()
-                        except Exception as e:
-                            log.warning(f"Could not create hypertable: {e}")
+                        conn.execute(
+                            text(
+                                "SELECT create_hypertable('ticks', 'ts', if_not_exists => TRUE);"
+                            )
+                        )
                 except Exception as e:
-                    log.warning(f"Could not check hypertable existence: {e}")
+                    log.warning("Hypertable creation skipped: %s", e)
         except Exception as e:
-            log.warning(f"Error in connecting to database for TimescaleDB operations: {e}")
+            log.warning("Timescale setup failed: %s", e)
+
+# -------------------------------------------------
+# FASTAPI DEPENDENCY
+# -------------------------------------------------
 
 def get_db() -> Generator:
     """
-    FastAPI dependency generator that yields a SQLAlchemy session and ensures it is closed.
-    Usage in FastAPI endpoints:
-        from fastapi import Depends
-        def endpoint(db = Depends(get_db)): ...
+    FastAPI dependency.
     """
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-

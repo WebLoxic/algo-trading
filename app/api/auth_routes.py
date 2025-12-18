@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from dotenv import load_dotenv
 from jose import jwt, JWTError, ExpiredSignatureError
+from sqlalchemy.exc import IntegrityError
 
 # Email libs
 import smtplib
@@ -302,22 +303,30 @@ def send_reset_email(to_email: str, token: str):
 
 
 # ------------------------ REGISTER ------------------------
+
 @router.post("/register", response_model=UserOut)
 def register(payload: RegisterPayload, request: Request, db: Session = Depends(get_db)):
-    # normalize email
-    email = payload.email.strip().lower()
 
-    # if Credential model exists
-    if hasattr(models, "Credential"):
-        # check existing credential
-        existing = db.query(models.Credential).filter(models.Credential.email == email).first()
+    try:
+        email = payload.email.strip().lower()
+
+        if not hasattr(models, "Credential"):
+            raise HTTPException(500, "Credential model missing")
+
+        existing = (
+            db.query(models.Credential)
+            .filter(models.Credential.email == email)
+            .first()
+        )
         if existing:
             raise HTTPException(400, "Email already registered")
 
-        # create user and credential, ensure user.email set BEFORE commit
-        user = models.User(full_name=payload.full_name, email=email)
+        user = models.User(
+            full_name=payload.full_name,
+            email=email
+        )
         db.add(user)
-        db.flush()  # ensures user.id is present
+        db.flush()   # user.id generated here
 
         cred = models.Credential(
             user_id=user.id,
@@ -326,12 +335,19 @@ def register(payload: RegisterPayload, request: Request, db: Session = Depends(g
         )
         db.add(cred)
 
-        # commit once for both user + credential
         db.commit()
-        db.refresh(user)  # refresh object from DB (optional)
+        db.refresh(user)
         return user
 
-    raise HTTPException(500, "User/Credential model missing")
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(400, "Email already exists")
+
+    except Exception as e:
+        db.rollback()
+        print("REGISTER ERROR:", e)
+        raise HTTPException(500, "Internal Server Error")
+
 
 
 # ------------------------ LOGIN ------------------------
